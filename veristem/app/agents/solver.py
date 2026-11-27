@@ -61,6 +61,7 @@ async def run_solver_agent(
     plan: ExecutionPlan,
     registry: SafeToolRegistry,
     correction: CorrectionRequest | None = None,
+    tool_cache: dict[str, ToolExecutionRecord] | None = None,
 ) -> tuple[SolverSynthesis, AgentExecutionResult]:
     started_at = utc_now()
     t0 = time.perf_counter()
@@ -85,24 +86,11 @@ async def run_solver_agent(
     )
     tool_plan = SolverToolCallPlan.model_validate(plan_resp.parsed)
 
-    records: list[ToolExecutionRecord] = []
-    for call in tool_plan.tool_calls:
-        try:
-            args = json.loads(call.arguments_json)
-            if not isinstance(args, dict):
-                raise ValueError("arguments_json must decode to a JSON object")
-            rec = registry.execute(call.tool_name, args)
-        except Exception as exc:
-            rec = ToolExecutionRecord(
-                tool_call_id=f"tc_parse_err_{call.task_id}",
-                tool_name=call.tool_name,
-                input_payload={"raw_arguments_json": call.arguments_json},
-                output_payload={},
-                success=False,
-                error_message=str(exc),
-                duration_ms=0.0,
-            )
-        records.append(rec)
+    cache = tool_cache if tool_cache is not None else {}
+    records = await registry.execute_parallel_with_cache(
+        [(c.task_id, c.tool_name, c.arguments_json) for c in tool_plan.tool_calls],
+        cache,
+    )
 
     synth_prompt = (
         f"ProblemSpecification:\n{spec.model_dump_json(indent=2)}\n\n"

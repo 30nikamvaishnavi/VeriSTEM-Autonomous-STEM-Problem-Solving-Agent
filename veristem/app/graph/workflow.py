@@ -39,6 +39,7 @@ def build_veristem_graph(
     on_transition: Any | None = None,
 ) -> Any:
     """Construct and compile the VeriSTEM LangGraph StateGraph with conditional routing and interrupts."""
+    tool_cache: dict[str, ToolExecutionRecord] = {}
 
     async def _notify(stage: str, state: VeriSTEMState, artifact: Any = None) -> None:
         if on_transition is not None:
@@ -119,6 +120,7 @@ def build_veristem_graph(
                 plan=plan,
                 registry=registry,
                 correction=correction,
+                tool_cache=tool_cache,
             )
             timeline = [*state.get("agent_timeline", []), agent_res.model_dump(mode="json")]
             tools = [*state.get("tool_records", []), *[r.model_dump(mode="json") for r in agent_res.tool_records]]
@@ -142,6 +144,7 @@ def build_veristem_graph(
                 synthesis=synthesis,
                 solver_tools=solver_tools,
                 registry=registry,
+                tool_cache=tool_cache,
             )
             timeline = [*state.get("agent_timeline", []), agent_res.model_dump(mode="json")]
             tools = [*state.get("tool_records", []), *[r.model_dump(mode="json") for r in agent_res.tool_records]]

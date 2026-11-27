@@ -4,6 +4,14 @@ export type ProblemDomain =
   | 'quantitative_finance'
   | 'general_stem';
 
+export type ComplexityLevel =
+  | 'LEVEL_1_SIMPLE'
+  | 'LEVEL_2_INTERMEDIATE'
+  | 'LEVEL_3_ADVANCED'
+  | 'LEVEL_4_RESEARCH';
+
+export type ExecutionPath = 'FAST_PATH' | 'MULTI_AGENT_WORKFLOW';
+
 export type VerificationStatus = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
 
 export type WorkflowStatus =
@@ -139,6 +147,9 @@ export interface FinalSolutionReport {
   tool_execution_history: ToolExecutionRecord[];
   confidence_limitations: string[];
   explanation_markdown: string;
+  complexity_level?: ComplexityLevel;
+  execution_path?: ExecutionPath;
+  elapsed_ms?: number;
   started_at: string;
   completed_at: string;
 }
@@ -150,6 +161,9 @@ export interface ProblemRecord {
   domain_hint: ProblemDomain | null;
   status: WorkflowStatus;
   current_stage: string;
+  complexity_level: ComplexityLevel | null;
+  execution_path: ExecutionPath | null;
+  elapsed_ms: number | null;
   correction_attempts: number;
   specification: ProblemSpecification | null;
   plan: ExecutionPlan | null;

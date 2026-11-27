@@ -52,6 +52,7 @@ export default function App() {
   const [question, setQuestion] = useState(CURATED_PRESETS[0].question);
   const [domainHint, setDomainHint] = useState<'auto' | ProblemDomain>('auto');
   const [maxAttempts, setMaxAttempts] = useState(3);
+  const [forceMultiAgent, setForceMultiAgent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -176,6 +177,7 @@ export default function App() {
         body: JSON.stringify({
           max_correction_attempts: maxAttempts,
           run_async: true,
+          force_multi_agent: forceMultiAgent,
         }),
       });
       if (!solveRes.ok) {
@@ -376,6 +378,16 @@ export default function App() {
                   </div>
                 </div>
 
+                <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={forceMultiAgent}
+                    onChange={(e) => setForceMultiAgent(e.target.checked)}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-600"
+                  />
+                  <span>Force full multi-agent workflow (bypass fast path)</span>
+                </label>
+
                 {errorMsg && (
                   <div className="p-3 bg-rose-50 border border-rose-200 rounded-md text-xs text-rose-700">
                     {errorMsg}
@@ -430,6 +442,9 @@ export default function App() {
                 currentStage={activeProblem?.current_stage ?? 'IDLE'}
                 workflowStatus={activeProblem?.status ?? null}
                 verificationStatus={activeProblem?.verification_report?.status ?? null}
+                complexityLevel={activeProblem?.complexity_level ?? null}
+                executionPath={activeProblem?.execution_path ?? null}
+                elapsedMs={activeProblem?.elapsed_ms ?? null}
                 correctionAttempts={activeProblem?.correction_attempts ?? 0}
                 timeline={activeProblem?.agent_timeline ?? []}
               />
@@ -605,6 +620,9 @@ export default function App() {
               currentStage={activeProblem?.current_stage ?? 'IDLE'}
               workflowStatus={activeProblem?.status ?? null}
               verificationStatus={activeProblem?.verification_report?.status ?? null}
+              complexityLevel={activeProblem?.complexity_level ?? null}
+              executionPath={activeProblem?.execution_path ?? null}
+              elapsedMs={activeProblem?.elapsed_ms ?? null}
               correctionAttempts={activeProblem?.correction_attempts ?? 0}
               timeline={activeProblem?.agent_timeline ?? []}
             />
@@ -688,9 +706,11 @@ export default function App() {
                   </div>
                 </div>
                 <div className="bg-white border border-slate-200 rounded-lg p-4">
-                  <div className="text-xs text-slate-500">Total Tool Executions</div>
+                  <div className="text-xs text-slate-500">Avg. Solve Time</div>
                   <div className="text-2xl font-mono font-semibold tabular-nums text-slate-900 mt-1">
-                    {metrics.total_tool_executions}
+                    {metrics.average_duration_ms >= 1000
+                      ? `${(metrics.average_duration_ms / 1000).toFixed(2)} s`
+                      : `${metrics.average_duration_ms.toFixed(1)} ms`}
                   </div>
                 </div>
                 <div className="bg-white border border-slate-200 rounded-lg p-4">
@@ -723,9 +743,10 @@ export default function App() {
                       <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
                         <th className="py-3 px-4 font-medium">Problem ID</th>
                         <th className="py-3 px-4 font-medium">Question</th>
-                        <th className="py-3 px-4 font-medium">Workflow</th>
+                        <th className="py-3 px-4 font-medium">Path</th>
+                        <th className="py-3 px-4 font-medium">Status</th>
                         <th className="py-3 px-4 font-medium">Verification</th>
-                        <th className="py-3 px-4 font-medium text-right">Retries</th>
+                        <th className="py-3 px-4 font-medium text-right">Elapsed</th>
                         <th className="py-3 px-4 font-medium text-right">Action</th>
                       </tr>
                     </thead>
@@ -739,6 +760,9 @@ export default function App() {
                             </td>
                             <td className="py-3 px-4 text-slate-700 max-w-md truncate">
                               {item.question}
+                            </td>
+                            <td className="py-3 px-4 font-mono text-slate-700 whitespace-nowrap">
+                              {item.execution_path ?? 'MULTI_AGENT_WORKFLOW'}
                             </td>
                             <td className="py-3 px-4 font-mono text-slate-700 whitespace-nowrap">
                               {item.status}
@@ -758,8 +782,12 @@ export default function App() {
                                 <span className="text-slate-400">{vStatus ?? '—'}</span>
                               )}
                             </td>
-                            <td className="py-3 px-4 font-mono tabular-nums text-right text-slate-700">
-                              {item.correction_attempts}
+                            <td className="py-3 px-4 font-mono tabular-nums text-right text-slate-700 whitespace-nowrap">
+                              {item.elapsed_ms !== null && item.elapsed_ms !== undefined
+                                ? item.elapsed_ms >= 1000
+                                  ? `${(item.elapsed_ms / 1000).toFixed(2)} s`
+                                  : `${item.elapsed_ms.toFixed(1)} ms`
+                                : '—'}
                             </td>
                             <td className="py-3 px-4 text-right whitespace-nowrap">
                               <button

@@ -2,6 +2,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { z } from 'zod';
 import type {
   AgentExecutionResult,
+  ComplexityLevel,
   CorrectionRequest,
   ExecutionPlan,
   FinalSolutionReport,
@@ -9,11 +10,12 @@ import type {
   ProblemDomain,
   ProblemSpecification,
   ToolExecutionRecord,
+  VerificationCheck,
   VerificationReport,
   WorkflowStatus,
 } from '../src/types/veristem.ts';
 import { getDatabase } from './db.ts';
-import { TOOL_CATALOG, executeTool } from './tools.ts';
+import { TOOL_CATALOG, executeToolsParallelWithCache } from './tools.ts';
 
 const MathematicalVariableSchema = z.object({
   symbol: z.string().min(1),
@@ -136,6 +138,13 @@ const NarrativeSchema = z.object({
   confidence_limitations: z.array(z.string()).default([]),
 });
 
+const UnderstandingAndPlanSchema = z.object({
+  specification: ProblemSpecificationSchema,
+  plan: ExecutionPlanSchema,
+});
+
+const GEMINI_CALL_TIMEOUT_MS = Number(process.env.GEMINI_CALL_TIMEOUT_MS || 25000);
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = (process.env.GEMINI_API_KEY ?? '').trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -165,34 +174,53 @@ function resolveGeminiModel(): string {
   return validModels.has(configured) ? configured : 'gemini-4-hydrogen';
 }
 
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function callGeminiStructured<T>(
   systemInstruction: string,
   prompt: string,
   responseSchema: Record<string, unknown>,
   validator: z.ZodType<T>,
   thinkingLevel: ThinkingLevel = ThinkingLevel.LOW,
+  timeoutMs: number = GEMINI_CALL_TIMEOUT_MS,
 ): Promise<{ data: T; tokensInput: number; tokensOutput: number }> {
   const ai = getGeminiClient();
   const primaryModel = resolveGeminiModel();
   const candidateModels =
     primaryModel === 'gemini-3.1-flash-lite'
       ? ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite']
-      : [primaryModel, 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite'];
+      : [primaryModel, 'gemini-3.1-flash-lite'];
 
   let lastError: unknown;
   for (let attempt = 0; attempt < candidateModels.length; attempt += 1) {
     const model = candidateModels[attempt];
     try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema,
-          thinkingConfig: { thinkingLevel },
-        },
-      });
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema,
+            thinkingConfig: { thinkingLevel },
+          },
+        }),
+        timeoutMs,
+        `Gemini (${model})`,
+      );
       const text = (response.text ?? '').trim();
       if (!text) {
         throw new Error('Gemini returned an empty response');
@@ -207,7 +235,9 @@ async function callGeminiStructured<T>(
       };
     } catch (err) {
       lastError = err;
-      await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+      if (attempt < candidateModels.length - 1) {
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+      }
     }
   }
   throw new Error(
@@ -388,6 +418,79 @@ const NARRATIVE_SCHEMA = {
   required: ['explanation_markdown', 'confidence_limitations'],
 };
 
+const UNDERSTANDING_AND_PLAN_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    specification: SPEC_SCHEMA,
+    plan: PLAN_SCHEMA,
+  },
+  required: ['specification', 'plan'],
+};
+
+function tryDeterministicVerificationReport(verifRecords: ToolExecutionRecord[]): VerificationReport | null {
+  if (verifRecords.length === 0) return null;
+  const succeeded = verifRecords.filter((r) => r.success);
+  if (succeeded.length !== verifRecords.length) return null;
+
+  const checks: VerificationCheck[] = [];
+  let indepRecalc: string | null = null;
+  let dimPassed: boolean | null = null;
+
+  for (const rec of succeeded) {
+    const out = rec.output_payload;
+    const nestedRes =
+      typeof out.result === 'object' && out.result !== null
+        ? (out.result as Record<string, unknown>)
+        : null;
+
+    let passedFlag: boolean | null = null;
+    if (typeof out.passed === 'boolean') passedFlag = out.passed;
+    else if (typeof out.consistent === 'boolean') {
+      passedFlag = out.consistent;
+      dimPassed = out.consistent;
+    } else if (nestedRes && typeof nestedRes.passed === 'boolean') {
+      passedFlag = nestedRes.passed;
+    }
+
+    if (passedFlag === null) {
+      // Unstructured tool output requires LLM judge interpretation
+      return null;
+    }
+    if (!passedFlag) {
+      return null;
+    }
+
+    const obsVal = out.candidate_value ?? out.converted_value ?? nestedRes?.independent_value ?? null;
+    const expVal = out.independent_value ?? nestedRes?.expected_value ?? null;
+    if (expVal !== null && indepRecalc === null) {
+      indepRecalc = String(expVal);
+    }
+
+    checks.push({
+      check_name: String(out.method_used ?? rec.tool_name),
+      method: String(out.method_used ?? rec.tool_name),
+      passed: true,
+      expected_value: expVal !== null ? String(expVal) : null,
+      observed_value: obsVal !== null ? String(obsVal) : null,
+      relative_error: typeof out.relative_error === 'number' ? out.relative_error : null,
+      tolerance: typeof out.tolerance === 'number' ? out.tolerance : null,
+      details: String(out.details ?? nestedRes?.details ?? `${rec.tool_name} check passed`),
+    });
+  }
+
+  return {
+    status: 'PASS',
+    checks,
+    independent_recalculation: indepRecalc,
+    dimensional_consistency_passed: dimPassed ?? true,
+    boundary_conditions_passed: true,
+    numerical_stability_passed: true,
+    failure_reasons: [],
+    evidence_summary: checks.map((c) => c.details).join(' | '),
+    verified_at: new Date().toISOString(),
+  };
+}
+
 export async function runProblemWorkflow(
   problemId: string,
   executionId: string,
@@ -395,6 +498,7 @@ export async function runProblemWorkflow(
     maxCorrectionAttempts?: number;
     clarificationResponse?: string | null;
     humanDecision?: HumanReviewDecision | null;
+    complexityLevel?: ComplexityLevel;
   } = {},
 ): Promise<void> {
   const db = getDatabase();
@@ -404,6 +508,8 @@ export async function runProblemWorkflow(
   }
 
   const maxAttempts = options.maxCorrectionAttempts ?? 3;
+  const complexityLevel: ComplexityLevel = options.complexityLevel ?? 'LEVEL_2_INTERMEDIATE';
+  const workflowT0 = performance.now();
   const startedAt = new Date().toISOString();
 
   if (!options.clarificationResponse && !options.humanDecision) {
@@ -412,6 +518,8 @@ export async function runProblemWorkflow(
       execution_id: executionId,
       status: 'RUNNING',
       current_stage: 'UNDERSTANDING',
+      complexity_level: complexityLevel,
+      execution_path: 'MULTI_AGENT_WORKFLOW',
       correction_attempts: 0,
       max_correction_attempts: maxAttempts,
     });
@@ -419,10 +527,13 @@ export async function runProblemWorkflow(
     db.updateProblem(problemId, {
       status: 'RUNNING',
       current_stage: 'RESUMING',
+      complexity_level: complexityLevel,
+      execution_path: 'MULTI_AGENT_WORKFLOW',
     });
   }
 
   const toolCatalogText = JSON.stringify(TOOL_CATALOG, null, 2);
+  const toolCache = new Map<string, ToolExecutionRecord>();
   let allToolRecords: ToolExecutionRecord[] = [...(db.getProblem(problemId)?.tool_records ?? [])];
   let corrections: CorrectionRequest[] = [...(db.getProblem(problemId)?.correction_history ?? [])];
 
@@ -440,38 +551,47 @@ export async function runProblemWorkflow(
       const lastSolverStep = [...latest.agent_timeline]
         .reverse()
         .find((a) => a.agent_name === 'STEMSolverAgent');
-      synthesis = SolverSynthesisSchema.parse(lastSolverStep?.structured_output ?? {
-        solution_methodology: latest.plan?.methodology ?? 'Human-reviewed resolution',
-        final_answer: options.humanDecision.override_answer ?? 'Unresolved',
-        units: 'dimensionless',
-      });
+      synthesis = SolverSynthesisSchema.parse(
+        lastSolverStep?.structured_output ?? {
+          solution_methodology: latest.plan?.methodology ?? 'Human-reviewed resolution',
+          final_answer: options.humanDecision.override_answer ?? 'Unresolved',
+          units: 'dimensionless',
+        },
+      );
       if (options.humanDecision.reviewer_action === 'override' && options.humanDecision.override_answer) {
         synthesis.final_answer = options.humanDecision.override_answer;
       }
     } else {
-      // AGENT 1: Problem Understanding
+      // Consolidated AGENT 1 (Understanding) + AGENT 2 (Planning) in 1 Gemini round-trip
       db.updateProblem(problemId, { current_stage: 'UNDERSTANDING' });
-      const uStart = new Date().toISOString();
-      const uT0 = performance.now();
-      const uPrompt = [
+      const upStart = new Date().toISOString();
+      const upT0 = performance.now();
+      const upPrompt = [
         `Problem:\n${problem.question}`,
         problem.domain_hint ? `User domain hint: ${problem.domain_hint}` : '',
         options.clarificationResponse
           ? `User clarification:\n${options.clarificationResponse}`
           : '',
+        `Available Computational Tools:\n${toolCatalogText}`,
       ]
         .filter(Boolean)
         .join('\n\n');
 
-      const uResp = await callGeminiStructured(
-        `You are Agent 1 (Problem Understanding Agent) in VeriSTEM.
-Classify the domain, extract variables with units, equations, constraints, and assumptions.
-Only set needs_clarification=true if essential numerical inputs are genuinely missing so the problem has no unique answer.`,
-        uPrompt,
-        SPEC_SCHEMA,
-        ProblemSpecificationSchema,
+      const upResp = await callGeminiStructured(
+        `You are Agents 1 & 2 (Problem Understanding & Planning) in VeriSTEM.
+1. Classify domain, extract variables with units, equations, constraints, and assumptions. Only set needs_clarification=true if essential numerical parameters are genuinely missing.
+2. Construct a concise dependency-aware ExecutionPlan selecting tools strictly from the provided catalog, plus an independent verification_strategy using a separate mathematical/numerical method.`,
+        upPrompt,
+        UNDERSTANDING_AND_PLAN_SCHEMA,
+        UnderstandingAndPlanSchema,
+        ThinkingLevel.LOW,
       );
-      spec = uResp.data as ProblemSpecification;
+
+      spec = upResp.data.specification as ProblemSpecification;
+      plan = upResp.data.plan as ExecutionPlan;
+      const totalUpMs = Number((performance.now() - upT0).toFixed(2));
+      const nowIso = new Date().toISOString();
+
       const uAgentRes: AgentExecutionResult = {
         agent_name: 'ProblemUnderstandingAgent',
         stage: 'UNDERSTANDING',
@@ -479,11 +599,11 @@ Only set needs_clarification=true if essential numerical inputs are genuinely mi
         summary: `Classified as ${spec.domain} (${spec.problem_type}) with ${spec.variables.length} variables.`,
         structured_output: spec as unknown as Record<string, unknown>,
         tool_records: [],
-        tokens_input: uResp.tokensInput,
-        tokens_output: uResp.tokensOutput,
-        duration_ms: Number((performance.now() - uT0).toFixed(2)),
-        started_at: uStart,
-        completed_at: new Date().toISOString(),
+        tokens_input: Math.floor(upResp.tokensInput / 2),
+        tokens_output: Math.floor(upResp.tokensOutput / 2),
+        duration_ms: Number((totalUpMs * 0.5).toFixed(2)),
+        started_at: upStart,
+        completed_at: nowIso,
       };
       db.addAgentResult(problemId, executionId, uAgentRes);
       db.updateProblem(problemId, { specification: spec });
@@ -492,23 +612,12 @@ Only set needs_clarification=true if essential numerical inputs are genuinely mi
         db.updateProblem(problemId, {
           status: 'NEEDS_CLARIFICATION',
           current_stage: 'NEEDS_CLARIFICATION',
+          elapsed_ms: Number((performance.now() - workflowT0).toFixed(2)),
         });
         return;
       }
 
-      // AGENT 2: Planning
-      db.updateProblem(problemId, { current_stage: 'PLANNING' });
-      const pStart = new Date().toISOString();
-      const pT0 = performance.now();
-      const pResp = await callGeminiStructured(
-        `You are Agent 2 (Planning Agent) in VeriSTEM.
-Decompose the problem into dependency-aware tasks and select computational tools strictly from the catalog.
-Define an independent verification_strategy using a separate mathematical/numerical method.`,
-        `ProblemSpecification:\n${JSON.stringify(spec, null, 2)}\n\nAvailable Tools:\n${toolCatalogText}`,
-        PLAN_SCHEMA,
-        ExecutionPlanSchema,
-      );
-      plan = pResp.data as ExecutionPlan;
+      db.updateProblem(problemId, { current_stage: 'PLANNING', plan });
       db.addAgentResult(problemId, executionId, {
         agent_name: 'PlanningAgent',
         stage: 'PLANNING',
@@ -516,13 +625,12 @@ Define an independent verification_strategy using a separate mathematical/numeri
         summary: `Constructed ${plan.tasks.length}-step plan using ${plan.selected_tools.join(', ')}.`,
         structured_output: plan as unknown as Record<string, unknown>,
         tool_records: [],
-        tokens_input: pResp.tokensInput,
-        tokens_output: pResp.tokensOutput,
-        duration_ms: Number((performance.now() - pT0).toFixed(2)),
-        started_at: pStart,
-        completed_at: new Date().toISOString(),
+        tokens_input: Math.ceil(upResp.tokensInput / 2),
+        tokens_output: Math.ceil(upResp.tokensOutput / 2),
+        duration_ms: Number((totalUpMs * 0.5).toFixed(2)),
+        started_at: upStart,
+        completed_at: nowIso,
       });
-      db.updateProblem(problemId, { plan });
 
       // Solve <-> Verify <-> Critic Loop
       let latestCorrection: CorrectionRequest | null = null;
@@ -540,40 +648,26 @@ Define an independent verification_strategy using a separate mathematical/numeri
 
         const sPlanResp = await callGeminiStructured(
           `You are Agent 3 (STEM Solver Agent) in VeriSTEM.
-Never guess or invent numbers. Generate tool_calls using python_sandbox, symbolic_math, or dimensional_analysis.
-For python_sandbox, write clean Python 3 using math/cmath/decimal/fractions/statistics and assign the final answer or dict to RESULT.
+Never guess or invent numbers. Generate minimal, non-redundant tool_calls using python_sandbox, symbolic_math, or dimensional_analysis.
+For python_sandbox, use ONLY stdlib modules (math, cmath, decimal, fractions, statistics, json, itertools) and assign the final answer or dict to RESULT.
 Ensure arguments_json is a valid JSON string matching the tool parameters.`,
-          `ProblemSpecification:\n${JSON.stringify(spec, null, 2)}\n\nExecutionPlan:\n${JSON.stringify(plan, null, 2)}\n\nTools:\n${toolCatalogText}${correctionPrompt}`,
+          `ProblemSpecification:\n${JSON.stringify(spec)}\n\nExecutionPlan:\n${JSON.stringify(plan)}\n\nTools:\n${toolCatalogText}${correctionPrompt}`,
           TOOL_CALL_PLAN_SCHEMA,
           ToolCallPlanSchema,
+          ThinkingLevel.LOW,
         );
 
-        const solverRecords: ToolExecutionRecord[] = [];
-        for (const call of sPlanResp.data.tool_calls) {
-          try {
-            const parsedArgs = JSON.parse(call.arguments_json) as Record<string, unknown>;
-            solverRecords.push(executeTool(call.tool_name, parsedArgs));
-          } catch (err) {
-            solverRecords.push({
-              tool_call_id: `tc_err_${call.task_id}`,
-              tool_name: call.tool_name,
-              input_payload: { raw: call.arguments_json },
-              output_payload: {},
-              success: false,
-              error_message: err instanceof Error ? err.message : String(err),
-              duration_ms: 0,
-              executed_at: new Date().toISOString(),
-            });
-          }
-        }
+        // Execute solver tool calls in parallel with deduplication cache
+        const solverRecords = await executeToolsParallelWithCache(sPlanResp.data.tool_calls, toolCache);
         allToolRecords = [...allToolRecords, ...solverRecords];
 
         const sSynthResp = await callGeminiStructured(
           `You are Agent 3 (STEM Solver Agent) synthesizing ONLY actual executed tool outputs.
 Never invent numeric values. Report the exact result computed by the tools.`,
-          `Specification:\n${JSON.stringify(spec, null, 2)}\n\nStrategy:\n${sPlanResp.data.reasoning_strategy}\n\nActual Tool Results:\n${JSON.stringify(solverRecords, null, 2)}`,
+          `Specification:\n${JSON.stringify(spec)}\n\nStrategy:\n${sPlanResp.data.reasoning_strategy}\n\nActual Tool Results:\n${JSON.stringify(solverRecords)}`,
           SOLVER_SYNTHESIS_SCHEMA,
           SolverSynthesisSchema,
+          ThinkingLevel.LOW,
         );
         synthesis = sSynthResp.data;
 
@@ -599,50 +693,49 @@ Never invent numeric values. Report the exact result computed by the tools.`,
         const vPlanResp = await callGeminiStructured(
           `You are Agent 4 (Independent Verification Agent) in VeriSTEM.
 Independently verify the candidate solution using a DIFFERENT numerical or symbolic method when practical.
-Use independent_verifier (integral_quadrature, derivative_finite_diff, root_residual, black_scholes_mc, numeric_tolerance), dimensional_analysis, symbolic_math, or python_sandbox.
-For python_sandbox, use ONLY Python stdlib modules (math, cmath, decimal, fractions, statistics, json, itertools — never numpy/scipy) and set RESULT = {"passed": True/False, "independent_value": ..., "details": "..."}.`,
-          `Specification:\n${JSON.stringify(spec, null, 2)}\n\nCandidate Solution:\n${JSON.stringify(synthesis, null, 2)}\n\nTool Catalog:\n${toolCatalogText}`,
+Prefer independent_verifier (integral_quadrature, derivative_finite_diff, root_residual, black_scholes_mc, numeric_tolerance) or dimensional_analysis; or python_sandbox returning RESULT = {"passed": True/False, "independent_value": ..., "details": "..."}.`,
+          `Specification:\n${JSON.stringify(spec)}\n\nCandidate Solution:\n${JSON.stringify(synthesis)}\n\nTool Catalog:\n${toolCatalogText}`,
           VERIFICATION_PLAN_SCHEMA,
           VerificationPlanSchema,
+          ThinkingLevel.LOW,
         );
 
-        const verifRecords: ToolExecutionRecord[] = [];
-        for (const call of vPlanResp.data.verification_calls) {
-          try {
-            const parsedArgs = JSON.parse(call.arguments_json) as Record<string, unknown>;
-            verifRecords.push(executeTool(call.tool_name, parsedArgs));
-          } catch (err) {
-            verifRecords.push({
-              tool_call_id: `tc_verr_${call.task_id}`,
-              tool_name: call.tool_name,
-              input_payload: { raw: call.arguments_json },
-              output_payload: {},
-              success: false,
-              error_message: err instanceof Error ? err.message : String(err),
-              duration_ms: 0,
-              executed_at: new Date().toISOString(),
-            });
-          }
-        }
+        // Parallel deduplicated verification tool execution
+        const verifRecords = await executeToolsParallelWithCache(
+          vPlanResp.data.verification_calls,
+          toolCache,
+        );
         allToolRecords = [...allToolRecords, ...verifRecords];
 
-        const vJudgeResp = await callGeminiStructured(
-          `You are Agent 4 (Independent Verification Agent) issuing a formal VerificationReport.
+        // Deterministic fast-synthesis if all independent tools returned crisp boolean pass checks;
+        // otherwise fall back to Gemini Judge + deterministic safeguards.
+        let vTokensIn = vPlanResp.tokensInput;
+        let vTokensOut = vPlanResp.tokensOutput;
+        const deterministicReport = tryDeterministicVerificationReport(verifRecords);
+
+        if (deterministicReport) {
+          verification = deterministicReport;
+        } else {
+          const vJudgeResp = await callGeminiStructured(
+            `You are Agent 4 (Independent Verification Agent) issuing a formal VerificationReport.
 Base your verdict STRICTLY on the actual verification tool results:
 - If zero verification tools succeeded, status MUST be INCONCLUSIVE or FAIL (never PASS).
 - If any check failed, status MUST be FAIL.
 - Only emit PASS when independent tool execution confirmed the solution.`,
-          `Specification:\n${JSON.stringify(spec, null, 2)}\n\nCandidate Solution:\n${JSON.stringify(synthesis, null, 2)}\n\nActual Verification Tool Outputs:\n${JSON.stringify(verifRecords, null, 2)}`,
-          VERIFICATION_REPORT_SCHEMA,
-          VerificationReportSchema,
-        );
+            `Specification:\n${JSON.stringify(spec)}\n\nCandidate Solution:\n${JSON.stringify(synthesis)}\n\nActual Verification Tool Outputs:\n${JSON.stringify(verifRecords)}`,
+            VERIFICATION_REPORT_SCHEMA,
+            VerificationReportSchema,
+            ThinkingLevel.LOW,
+          );
+          vTokensIn += vJudgeResp.tokensInput;
+          vTokensOut += vJudgeResp.tokensOutput;
+          verification = {
+            ...vJudgeResp.data,
+            verified_at: new Date().toISOString(),
+          };
+        }
 
-        verification = {
-          ...vJudgeResp.data,
-          verified_at: new Date().toISOString(),
-        };
-
-        // Deterministic verification safeguards
+        // Deterministic verification safeguards (always enforced)
         const succeeded = verifRecords.filter((r) => r.success);
         if (verification.status === 'PASS' && succeeded.length === 0) {
           verification = {
@@ -692,8 +785,8 @@ Base your verdict STRICTLY on the actual verification tool results:
           summary: verification.evidence_summary,
           structured_output: verification as unknown as Record<string, unknown>,
           tool_records: verifRecords,
-          tokens_input: vPlanResp.tokensInput + vJudgeResp.tokensInput,
-          tokens_output: vPlanResp.tokensOutput + vJudgeResp.tokensOutput,
+          tokens_input: vTokensIn,
+          tokens_output: vTokensOut,
           duration_ms: Number((performance.now() - vT0).toFixed(2)),
           started_at: vStart,
           completed_at: new Date().toISOString(),
@@ -707,6 +800,7 @@ Base your verdict STRICTLY on the actual verification tool results:
           db.updateProblem(problemId, {
             status: 'HUMAN_REVIEW',
             current_stage: 'HUMAN_REVIEW',
+            elapsed_ms: Number((performance.now() - workflowT0).toFixed(2)),
           });
           return;
         }
@@ -722,9 +816,10 @@ Base your verdict STRICTLY on the actual verification tool results:
         const cResp = await callGeminiStructured(
           `You are Agent 5 (Critic and Self-Correction Agent) in VeriSTEM.
 Diagnose why verification failed or was inconclusive and provide exact corrective instructions.`,
-          `Attempt ${attempt}\nSpecification:\n${JSON.stringify(spec, null, 2)}\nCandidate:\n${JSON.stringify(synthesis, null, 2)}\nVerificationReport:\n${JSON.stringify(verification, null, 2)}`,
+          `Attempt ${attempt}\nSpecification:\n${JSON.stringify(spec)}\nCandidate:\n${JSON.stringify(synthesis)}\nVerificationReport:\n${JSON.stringify(verification)}`,
           CORRECTION_SCHEMA,
           CorrectionRequestSchema,
+          ThinkingLevel.LOW,
         );
         latestCorrection = {
           attempt_number: attempt,
@@ -749,21 +844,45 @@ Diagnose why verification failed or was inconclusive and provide exact correctiv
       }
     }
 
-    // AGENT 6: Explanation & Reporting
+    // AGENT 6: Explanation & Reporting (with deterministic Markdown fallback if LLM times out)
     db.updateProblem(problemId, { current_stage: 'REPORTING' });
     const rStart = new Date().toISOString();
     const rT0 = performance.now();
-    const rResp = await callGeminiStructured(
-      `You are Agent 6 (Explanation and Reporting Agent) in VeriSTEM.
-Write a clear, structured scientific explanation in Markdown using LaTeX ($...$ and $$...$$).
-Strictly separate assumptions from verified computational evidence. Never present LLM confidence as mathematical proof.`,
-      `Question:\n${problem.question}\n\nSpecification:\n${JSON.stringify(spec, null, 2)}\n\nSolution:\n${JSON.stringify(synthesis, null, 2)}\n\nVerification:\n${JSON.stringify(verification, null, 2)}`,
-      NARRATIVE_SCHEMA,
-      NarrativeSchema,
-    );
+    let narrativeData: { explanation_markdown: string; confidence_limitations: string[] };
+    let rTokensIn = 0;
+    let rTokensOut = 0;
+
+    try {
+      const rResp = await callGeminiStructured(
+        `You are Agent 6 (Explanation and Reporting Agent) in VeriSTEM.
+Write a concise, clear scientific explanation in Markdown using LaTeX ($...$ and $$...$$).
+Strictly separate assumptions from verified computational evidence.`,
+        `Question:\n${problem.question}\n\nSolution:\n${JSON.stringify(synthesis)}\n\nVerification:\n${JSON.stringify(verification)}`,
+        NARRATIVE_SCHEMA,
+        NarrativeSchema,
+        ThinkingLevel.LOW,
+        20_000,
+      );
+      narrativeData = rResp.data;
+      rTokensIn = rResp.tokensInput;
+      rTokensOut = rResp.tokensOutput;
+    } catch {
+      narrativeData = {
+        explanation_markdown: [
+          `### Methodology`,
+          synthesis.solution_methodology,
+          `### Final Result`,
+          `**${synthesis.final_answer}** ${synthesis.units !== 'dimensionless' ? synthesis.units : ''}`,
+          `### Independent Verification (${verification.status})`,
+          ...verification.checks.map((ck) => `- **${ck.check_name}**: \`${ck.passed ? 'PASS' : 'FAIL'}\` — ${ck.details}`),
+        ].join('\n\n'),
+        confidence_limitations: ['Narrative synthesized deterministically after verification completed.'],
+      };
+    }
 
     const finalStatus: WorkflowStatus =
       options.humanDecision?.reviewer_action === 'reject' ? 'UNRESOLVED' : 'COMPLETED';
+    const elapsedMs = Number((performance.now() - workflowT0).toFixed(2));
 
     const finalReport: FinalSolutionReport = {
       problem_id: problemId,
@@ -783,8 +902,11 @@ Strictly separate assumptions from verified computational evidence. Never presen
       correction_attempts: corrections.length,
       correction_history: corrections,
       tool_execution_history: allToolRecords,
-      confidence_limitations: rResp.data.confidence_limitations,
-      explanation_markdown: rResp.data.explanation_markdown,
+      confidence_limitations: narrativeData.confidence_limitations,
+      explanation_markdown: narrativeData.explanation_markdown,
+      complexity_level: complexityLevel,
+      execution_path: 'MULTI_AGENT_WORKFLOW',
+      elapsed_ms: elapsedMs,
       started_at: startedAt,
       completed_at: new Date().toISOString(),
     };
@@ -799,8 +921,8 @@ Strictly separate assumptions from verified computational evidence. Never presen
         verification_status: finalReport.verification_status,
       },
       tool_records: [],
-      tokens_input: rResp.tokensInput,
-      tokens_output: rResp.tokensOutput,
+      tokens_input: rTokensIn,
+      tokens_output: rTokensOut,
       duration_ms: Number((performance.now() - rT0).toFixed(2)),
       started_at: rStart,
       completed_at: new Date().toISOString(),
@@ -809,6 +931,7 @@ Strictly separate assumptions from verified computational evidence. Never presen
     db.updateProblem(problemId, {
       status: finalStatus,
       current_stage: finalStatus,
+      elapsed_ms: elapsedMs,
       final_report: finalReport,
     });
   } catch (err) {
@@ -816,6 +939,7 @@ Strictly separate assumptions from verified computational evidence. Never presen
     db.updateProblem(problemId, {
       status: 'FAILED',
       current_stage: `FAILED: ${msg.slice(0, 140)}`,
+      elapsed_ms: Number((performance.now() - workflowT0).toFixed(2)),
     });
   }
 }

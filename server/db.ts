@@ -1,8 +1,11 @@
+import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import type {
   AgentExecutionResult,
+  ComplexityLevel,
   CorrectionRequest,
+  ExecutionPath,
   ExecutionPlan,
   FinalSolutionReport,
   HumanReviewDecision,
@@ -15,12 +18,16 @@ import type {
   WorkflowStatus,
 } from '../src/types/veristem.ts';
 
-const DB_PATH = path.resolve(process.cwd(), 'veristem_web.db');
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DB_PATH = path.join(DATA_DIR, 'veristem_web.db');
 
 export class VeriSTEMDatabase {
   private db: DatabaseSync;
 
   constructor(dbPath: string = DB_PATH) {
+    if (dbPath !== ':memory:') {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    }
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
@@ -36,6 +43,9 @@ export class VeriSTEMDatabase {
         domain_hint TEXT,
         status TEXT NOT NULL DEFAULT 'PENDING',
         current_stage TEXT NOT NULL DEFAULT 'CREATED',
+        complexity_level TEXT,
+        execution_path TEXT,
+        elapsed_ms REAL,
         specification_json TEXT,
         plan_json TEXT,
         verification_json TEXT,
@@ -84,6 +94,27 @@ export class VeriSTEMDatabase {
         created_at TEXT NOT NULL
       );
     `);
+
+    // Migrate existing tables gracefully if columns were added
+    const cols = this.db.prepare('PRAGMA table_info(problems)').all() as Array<{ name: string }>;
+    const existing = new Set(cols.map((c) => c.name));
+    if (!existing.has('complexity_level')) {
+      this.db.exec('ALTER TABLE problems ADD COLUMN complexity_level TEXT;');
+    }
+    if (!existing.has('execution_path')) {
+      this.db.exec('ALTER TABLE problems ADD COLUMN execution_path TEXT;');
+    }
+    if (!existing.has('elapsed_ms')) {
+      this.db.exec('ALTER TABLE problems ADD COLUMN elapsed_ms REAL;');
+    }
+  }
+
+  public close(): void {
+    try {
+      this.db.close();
+    } catch {
+      // Already closed
+    }
   }
 
   public isHealthy(): boolean {
@@ -132,6 +163,9 @@ export class VeriSTEMDatabase {
       execution_id?: string;
       status?: WorkflowStatus;
       current_stage?: string;
+      complexity_level?: ComplexityLevel;
+      execution_path?: ExecutionPath;
+      elapsed_ms?: number;
       specification?: ProblemSpecification;
       plan?: ExecutionPlan;
       verification_report?: VerificationReport;
@@ -155,6 +189,18 @@ export class VeriSTEMDatabase {
     if (patch.current_stage !== undefined) {
       sets.push('current_stage = ?');
       values.push(patch.current_stage);
+    }
+    if (patch.complexity_level !== undefined) {
+      sets.push('complexity_level = ?');
+      values.push(patch.complexity_level);
+    }
+    if (patch.execution_path !== undefined) {
+      sets.push('execution_path = ?');
+      values.push(patch.execution_path);
+    }
+    if (patch.elapsed_ms !== undefined) {
+      sets.push('elapsed_ms = ?');
+      values.push(patch.elapsed_ms);
     }
     if (patch.specification !== undefined) {
       sets.push('specification_json = ?');
@@ -248,6 +294,9 @@ export class VeriSTEMDatabase {
       domain_hint: (row.domain_hint as ProblemDomain | null) ?? null,
       status: row.status as WorkflowStatus,
       current_stage: String(row.current_stage),
+      complexity_level: (row.complexity_level as ComplexityLevel | null) ?? null,
+      execution_path: (row.execution_path as ExecutionPath | null) ?? null,
+      elapsed_ms: row.elapsed_ms !== null && row.elapsed_ms !== undefined ? Number(row.elapsed_ms) : null,
       correction_attempts: Number(row.correction_attempts ?? 0),
       specification: row.specification_json ? JSON.parse(String(row.specification_json)) : null,
       plan: row.plan_json ? JSON.parse(String(row.plan_json)) : null,
@@ -278,7 +327,8 @@ export class VeriSTEMDatabase {
            COUNT(*) AS total,
            SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed,
            SUM(CASE WHEN status IN ('UNRESOLVED', 'HUMAN_REVIEW') THEN 1 ELSE 0 END) AS unresolved,
-           COALESCE(AVG(correction_attempts), 0) AS avg_retries
+           COALESCE(AVG(correction_attempts), 0) AS avg_retries,
+           COALESCE(AVG(elapsed_ms), 0) AS avg_elapsed
          FROM problems`,
       )
       .get() as Record<string, number>;
@@ -298,9 +348,6 @@ export class VeriSTEMDatabase {
     const toolStats = this.db
       .prepare('SELECT COUNT(*) AS cnt FROM tool_records')
       .get() as { cnt: number };
-    const agentStats = this.db
-      .prepare('SELECT COALESCE(AVG(duration_ms), 0) AS avg_dur FROM agent_states')
-      .get() as { avg_dur: number };
 
     return {
       total_problems: Number(counts.total ?? 0),
@@ -309,7 +356,7 @@ export class VeriSTEMDatabase {
       failed_verifications: failed,
       unresolved_problems: Number(counts.unresolved ?? 0),
       average_correction_attempts: Number(Number(counts.avg_retries ?? 0).toFixed(3)),
-      average_duration_ms: Number(Number(agentStats.avg_dur ?? 0).toFixed(2)),
+      average_duration_ms: Number(Number(counts.avg_elapsed ?? 0).toFixed(2)),
       total_tool_executions: Number(toolStats.cnt ?? 0),
     };
   }

@@ -1,12 +1,15 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express, { type NextFunction, type Request, type Response, Router } from 'express';
-import { createServer as createViteServer } from 'vite';
+import { createServer as createViteServer, type ViteDevServer } from 'vite';
 import { z } from 'zod';
 import type { BenchmarkCase, HumanReviewDecision, ProblemDomain } from './src/types/veristem.ts';
+import { classifyProblemComplexity } from './server/complexity_router.ts';
 import { getDatabase } from './server/db.ts';
+import { tryFastPathSolve } from './server/fast_path.ts';
 import { runProblemWorkflow } from './server/workflow.ts';
 
 dotenv.config();
@@ -14,9 +17,32 @@ dotenv.config();
 const PORT = 3000;
 const MAX_PROBLEM_CHARS = 8000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_REQUESTS_PER_MINUTE || 60);
-const SESSION_SIGNING_SECRET =
-  (process.env.SESSION_SECRET ?? '').trim() || crypto.randomBytes(32).toString('hex');
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_REQUESTS_PER_MINUTE || 180);
+function resolveSessionSecret(): string {
+  const configured = (process.env.SESSION_SECRET ?? '').trim();
+  const isPlaceholder =
+    !configured ||
+    configured === 'your_secure_session_secret_here' ||
+    configured.startsWith('MY_') ||
+    configured.length < 32;
+
+  if (isPlaceholder) {
+    if (configured && configured !== 'your_secure_session_secret_here') {
+      console.warn(
+        'SESSION_SECRET in environment is shorter than 32 characters; using an ephemeral CSPRNG secret in memory.',
+      );
+    } else if (process.env.NODE_ENV === 'production') {
+      console.warn(
+        'SESSION_SECRET is missing or placeholder in production; using an ephemeral CSPRNG secret in memory.',
+      );
+    }
+    return crypto.randomBytes(48).toString('hex');
+  }
+
+  return configured;
+}
+
+const SESSION_SIGNING_SECRET = resolveSessionSecret();
 
 const rateBuckets = new Map<string, number[]>();
 
@@ -46,11 +72,13 @@ function verifyWorkbenchToken(token: string): boolean {
 }
 
 function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const key = req.ip || 'unknown';
+  const isRead = req.method === 'GET';
+  const key = `${req.ip || 'unknown'}:${isRead ? 'read' : 'write'}`;
   const now = Date.now();
   const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  const effectiveMax = isRead ? Math.max(RATE_LIMIT_MAX * 10, 300) : RATE_LIMIT_MAX;
   const timestamps = (rateBuckets.get(key) ?? []).filter((t) => t > cutoff);
-  if (timestamps.length >= RATE_LIMIT_MAX) {
+  if (timestamps.length >= effectiveMax) {
     res.status(429).json({
       error_code: 'RATE_LIMIT_EXCEEDED',
       message: 'Too many requests; please retry shortly.',
@@ -111,6 +139,7 @@ const SolveProblemBody = z.object({
   idempotency_key: z.string().max(128).optional(),
   max_correction_attempts: z.number().int().min(1).max(5).default(3),
   run_async: z.boolean().default(true),
+  force_multi_agent: z.boolean().default(false),
 });
 
 const ResumeProblemBody = z.object({
@@ -206,14 +235,63 @@ function buildProtectedRoutes(): Router {
         db.saveIdempotent(parsed.data.idempotency_key, problemId, executionId);
       }
 
+      const decision = classifyProblemComplexity(problem.question, problem.domain_hint);
+      const effectivePath = parsed.data.force_multi_agent
+        ? 'MULTI_AGENT_WORKFLOW'
+        : decision.execution_path;
+
+      if (effectivePath === 'FAST_PATH') {
+        db.clearExecutionArtifacts(problemId);
+        db.updateProblem(problemId, {
+          execution_id: executionId,
+          status: 'RUNNING',
+          current_stage: 'FAST_PATH',
+          complexity_level: decision.complexity_level,
+          execution_path: 'FAST_PATH',
+          correction_attempts: 0,
+        });
+
+        const fastResult = await tryFastPathSolve(problemId, executionId, problem.question, decision);
+        if (fastResult.handled && fastResult.final_report && fastResult.verification_report) {
+          for (const agentStep of fastResult.agent_timeline ?? []) {
+            db.addAgentResult(problemId, executionId, agentStep);
+          }
+          db.updateProblem(problemId, {
+            status: 'COMPLETED',
+            current_stage: 'COMPLETED',
+            complexity_level: decision.complexity_level,
+            execution_path: 'FAST_PATH',
+            elapsed_ms: fastResult.final_report.elapsed_ms,
+            specification: fastResult.specification,
+            plan: fastResult.plan,
+            verification_report: fastResult.verification_report,
+            final_report: fastResult.final_report,
+          });
+          res.status(200).json({
+            problem_id: problemId,
+            execution_id: executionId,
+            status: 'COMPLETED',
+            complexity_level: decision.complexity_level,
+            execution_path: 'FAST_PATH',
+            elapsed_ms: fastResult.final_report.elapsed_ms,
+            verification_status: fastResult.verification_report.status,
+            message: 'Solved and independently verified via deterministic Fast Path.',
+          });
+          return;
+        }
+      }
+
       if (parsed.data.run_async) {
         void runProblemWorkflow(problemId, executionId, {
           maxCorrectionAttempts: parsed.data.max_correction_attempts,
+          complexityLevel: decision.complexity_level,
         });
         res.status(202).json({
           problem_id: problemId,
           execution_id: executionId,
           status: 'RUNNING',
+          complexity_level: decision.complexity_level,
+          execution_path: 'MULTI_AGENT_WORKFLOW',
           message: 'Multi-agent verification workflow started in background.',
         });
         return;
@@ -221,12 +299,17 @@ function buildProtectedRoutes(): Router {
 
       await runProblemWorkflow(problemId, executionId, {
         maxCorrectionAttempts: parsed.data.max_correction_attempts,
+        complexityLevel: decision.complexity_level,
       });
       const updated = db.getProblem(problemId)!;
       res.status(200).json({
         problem_id: problemId,
         execution_id: executionId,
         status: updated.status,
+        complexity_level: updated.complexity_level,
+        execution_path: updated.execution_path,
+        elapsed_ms: updated.elapsed_ms,
+        verification_status: updated.verification_report?.status ?? null,
         message: 'Multi-agent verification workflow completed.',
       });
     },
@@ -260,6 +343,9 @@ function buildProtectedRoutes(): Router {
       execution_id: problem.execution_id,
       status: problem.status,
       current_stage: problem.current_stage,
+      complexity_level: problem.complexity_level,
+      execution_path: problem.execution_path,
+      elapsed_ms: problem.elapsed_ms,
       correction_attempts: problem.correction_attempts,
       verification_status: problem.verification_report?.status ?? null,
       needs_clarification: problem.specification?.needs_clarification ?? false,
@@ -413,6 +499,9 @@ async function startServer(): Promise<void> {
   // First-party React Workbench routes protected by signed session token + custom header
   app.use('/api/web', workbenchSessionMiddleware, sharedRouter);
 
+  const httpServer = http.createServer(app);
+  let vite: ViteDevServer | null = null;
+
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -420,14 +509,40 @@ async function startServer(): Promise<void> {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
+    const disableHmr = process.env.DISABLE_HMR === 'true';
+    vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+        ...(disableHmr ? { hmr: false } : {}),
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`VeriSTEM server shutting down on ${signal}...`);
+    try {
+      if (vite) {
+        await vite.close();
+      }
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve());
+      });
+    } finally {
+      db.close();
+      process.exit(0);
+    }
+  };
+
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`VeriSTEM server running on http://0.0.0.0:${PORT}`);
   });
 }

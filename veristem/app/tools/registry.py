@@ -127,6 +127,43 @@ class SafeToolRegistry:
                 duration_ms=duration_ms,
             )
 
+    async def execute_parallel_with_cache(
+        self,
+        calls: list[tuple[str, str, str]],
+        cache: dict[str, ToolExecutionRecord],
+    ) -> list[ToolExecutionRecord]:
+        import asyncio
+        import json
+
+        async def _run_one(task_id: str, tool_name: str, args_json: str) -> ToolExecutionRecord:
+            try:
+                args = json.loads(args_json)
+                if not isinstance(args, dict):
+                    raise ValueError("arguments_json must decode to a JSON object")
+            except Exception as exc:
+                return ToolExecutionRecord(
+                    tool_call_id=f"tc_parse_err_{task_id}",
+                    tool_name=tool_name,
+                    input_payload={"raw_arguments_json": args_json},
+                    output_payload={},
+                    success=False,
+                    error_message=str(exc),
+                    duration_ms=0.0,
+                )
+
+            cache_key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+            if cache_key in cache:
+                cached = cache[cache_key]
+                return cached.model_copy(
+                    update={"tool_call_id": f"tc_cached_{uuid.uuid4().hex[:8]}", "duration_ms": 0.0}
+                )
+            rec = await asyncio.to_thread(self.execute, tool_name, args)
+            if rec.success:
+                cache[cache_key] = rec
+            return rec
+
+        return list(await asyncio.gather(*(_run_one(tid, tname, ajson) for tid, tname, ajson in calls)))
+
 
 _REGISTRY: SafeToolRegistry | None = None
 

@@ -125,31 +125,44 @@ async def solve_problem(
     if body.idempotency_key:
         await repo.save_idempotent_execution(body.idempotency_key, problem_id, execution_id)
 
-    if body.run_async:
-        background_tasks.add_task(
-            workflow.execute_problem,
+    from app.router.complexity import classify_problem_complexity
+    from app.schemas.models import ExecutionPath, ProblemDomain
+
+    domain_hint = ProblemDomain(problem.domain_hint) if problem.domain_hint else None
+    decision = classify_problem_complexity(problem.question, domain_hint)
+
+    if (decision.execution_path == ExecutionPath.FAST_PATH and not body.force_multi_agent) or not body.run_async:
+        await workflow.execute_problem(
             problem_id=problem_id,
             execution_id=execution_id,
             max_correction_attempts=body.max_correction_attempts,
+            force_multi_agent=body.force_multi_agent,
         )
-        return SolveProblemResponse(
-            problem_id=problem_id,
-            execution_id=execution_id,
-            status=WorkflowStatus.RUNNING,
-            message="Multi-agent verification workflow started in background.",
-        )
+        refreshed = await repo.get_problem(problem_id)
+        if refreshed.status == WorkflowStatus.COMPLETED.value:
+            return SolveProblemResponse(
+                problem_id=problem_id,
+                execution_id=execution_id,
+                status=WorkflowStatus(refreshed.status),
+                complexity_level=decision.complexity_level,
+                execution_path=decision.execution_path if not body.force_multi_agent else ExecutionPath.MULTI_AGENT_WORKFLOW,
+                message="Solved and verified.",
+            )
 
-    await workflow.execute_problem(
+    background_tasks.add_task(
+        workflow.execute_problem,
         problem_id=problem_id,
         execution_id=execution_id,
         max_correction_attempts=body.max_correction_attempts,
+        force_multi_agent=body.force_multi_agent,
     )
-    refreshed = await repo.get_problem(problem_id)
     return SolveProblemResponse(
         problem_id=problem_id,
         execution_id=execution_id,
-        status=WorkflowStatus(refreshed.status),
-        message="Multi-agent verification workflow completed synchronously.",
+        status=WorkflowStatus.RUNNING,
+        complexity_level=decision.complexity_level,
+        execution_path=ExecutionPath.MULTI_AGENT_WORKFLOW,
+        message="Multi-agent verification workflow started in background.",
     )
 
 

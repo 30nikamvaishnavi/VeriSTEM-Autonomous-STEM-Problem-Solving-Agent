@@ -12,18 +12,22 @@ from app.database.repository import ProblemRepository
 from app.database.session import get_session_factory
 from app.graph.state import VeriSTEMState
 from app.graph.workflow import build_veristem_graph
+from app.router.complexity import classify_problem_complexity
 from app.schemas.models import (
     AgentExecutionResult,
     CorrectionRequest,
+    ExecutionPath,
     ExecutionPlan,
     FinalSolutionReport,
     HumanReviewDecision,
+    ProblemDomain,
     ProblemSpecification,
     ResumeProblemRequest,
     VerificationReport,
     WorkflowStatus,
     utc_now,
 )
+from app.services.fast_path import try_fast_path_solve
 from app.services.gemini_client import GeminiGateway, LLMGateway
 from app.tools.registry import get_tool_registry
 
@@ -121,6 +125,7 @@ class WorkflowService:
         problem_id: str,
         execution_id: str | None = None,
         max_correction_attempts: int = 3,
+        force_multi_agent: bool = False,
     ) -> None:
         settings = get_settings()
         exec_id = execution_id or f"exec_{uuid.uuid4().hex[:12]}"
@@ -129,6 +134,34 @@ class WorkflowService:
         async with factory() as session:
             repo = ProblemRepository(session)
             problem = await repo.get_problem(problem_id)
+            domain_hint = ProblemDomain(problem.domain_hint) if problem.domain_hint else None
+            decision = classify_problem_complexity(problem.question, domain_hint)
+
+            if decision.execution_path == ExecutionPath.FAST_PATH and not force_multi_agent:
+                fast_out = await asyncio.to_thread(
+                    try_fast_path_solve,
+                    problem_id=problem_id,
+                    execution_id=exec_id,
+                    question=problem.question,
+                    decision=decision,
+                    registry=self.registry,
+                )
+                if fast_out.handled and fast_out.final_report is not None and fast_out.verification_report is not None:
+                    await repo.update_workflow_state(
+                        problem_id,
+                        execution_id=exec_id,
+                        status=WorkflowStatus.COMPLETED,
+                        current_stage="COMPLETED",
+                        specification=fast_out.specification,
+                    )
+                    if fast_out.plan is not None:
+                        await repo.add_execution_plan(problem_id, exec_id, fast_out.plan)
+                    for ag in fast_out.agent_timeline or []:
+                        await repo.add_agent_result(problem_id, exec_id, ag)
+                    await repo.add_verification_result(problem_id, exec_id, 0, fast_out.verification_report)
+                    await repo.save_final_report(problem_id, exec_id, fast_out.final_report)
+                    return
+
             await repo.update_workflow_state(
                 problem_id,
                 execution_id=exec_id,

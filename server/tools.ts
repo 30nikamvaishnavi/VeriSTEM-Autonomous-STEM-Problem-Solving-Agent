@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -43,17 +43,7 @@ export const TOOL_CATALOG: ToolSpec[] = [
   },
 ];
 
-function runIsolatedPython(code: string, timeoutMs = 8000): {
-  stdout: string;
-  stderr: string;
-  result: unknown;
-  exitCode: number;
-} {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'veristem_py_'));
-  const runnerPath = path.join(tmpDir, 'runner.py');
-
-  // Python AST pre-check + isolated execution inside the child process
-  const runnerSource = `
+const RUNNER_SOURCE = `
 import ast
 import json
 import sys
@@ -100,8 +90,40 @@ exec(compile(tree, "<sandbox>", "exec"), ns, ns)
 print("__VERISTEM_RESULT__:" + json.dumps(ns.get("RESULT"), default=str))
 `;
 
+function parsePythonOutput(stdoutRaw: string, stderrRaw: string, exitCode: number): {
+  stdout: string;
+  stderr: string;
+  result: unknown;
+  exitCode: number;
+} {
+  let result: unknown = null;
+  const stdoutLines: string[] = [];
+  for (const line of stdoutRaw.split('\n')) {
+    if (line.startsWith('__VERISTEM_RESULT__:')) {
+      result = JSON.parse(line.slice('__VERISTEM_RESULT__:'.length));
+    } else if (line.length > 0) {
+      stdoutLines.push(line);
+    }
+  }
+  return {
+    stdout: stdoutLines.join('\n').slice(0, 4000),
+    stderr: stderrRaw.slice(0, 2000),
+    result,
+    exitCode,
+  };
+}
+
+function runIsolatedPython(code: string, timeoutMs = 8000): {
+  stdout: string;
+  stderr: string;
+  result: unknown;
+  exitCode: number;
+} {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'veristem_py_'));
+  const runnerPath = path.join(tmpDir, 'runner.py');
+
   try {
-    fs.writeFileSync(runnerPath, runnerSource, 'utf-8');
+    fs.writeFileSync(runnerPath, RUNNER_SOURCE, 'utf-8');
     const proc = spawnSync('python3', ['-I', runnerPath], {
       input: code,
       encoding: 'utf-8',
@@ -119,120 +141,161 @@ print("__VERISTEM_RESULT__:" + json.dumps(ns.get("RESULT"), default=str))
       throw proc.error;
     }
 
-    let result: unknown = null;
-    const stdoutLines: string[] = [];
-    for (const line of (proc.stdout || '').split('\n')) {
-      if (line.startsWith('__VERISTEM_RESULT__:')) {
-        result = JSON.parse(line.slice('__VERISTEM_RESULT__:'.length));
-      } else if (line.length > 0) {
-        stdoutLines.push(line);
-      }
-    }
-
-    return {
-      stdout: stdoutLines.join('\n').slice(0, 4000),
-      stderr: (proc.stderr || '').slice(0, 2000),
-      result,
-      exitCode: proc.status ?? 1,
-    };
+    return parsePythonOutput(proc.stdout || '', proc.stderr || '', proc.status ?? 1);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-export function executeTool(toolName: string, inputPayload: Record<string, unknown>): ToolExecutionRecord {
-  const callId = `tc_${crypto.randomBytes(6).toString('hex')}`;
-  const t0 = performance.now();
+export async function runIsolatedPythonAsync(code: string, timeoutMs = 8000): Promise<{
+  stdout: string;
+  stderr: string;
+  result: unknown;
+  exitCode: number;
+}> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'veristem_py_'));
+  const runnerPath = path.join(tmpDir, 'runner.py');
+  fs.writeFileSync(runnerPath, RUNNER_SOURCE, 'utf-8');
 
-  try {
-    let output: Record<string, unknown> = {};
+  return await new Promise((resolve, reject) => {
+    const child = spawn('python3', ['-I', runnerPath], {
+      cwd: tmpDir,
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        PYTHONNOUSERSITE: '1',
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
+    });
 
-    if (toolName === 'symbolic_math') {
-      const op = String(inputPayload.operation ?? 'evaluate');
-      const expr = String(inputPayload.expression ?? '');
-      const variable = String(inputPayload.variable ?? 'x');
-      const subs = (inputPayload.substitutions as Record<string, number> | undefined) ?? {};
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
 
-      if (op === 'diff') {
-        const d = math.derivative(expr, variable);
-        const evaluated = Object.keys(subs).length > 0 ? Number(d.evaluate(subs)) : null;
-        output = { operation: op, result_str: d.toString(), result_latex: d.toTex(), numeric_approx: evaluated };
-      } else if (op === 'simplify') {
-        const s = math.simplify(expr);
-        output = { operation: op, result_str: s.toString(), result_latex: s.toTex() };
-      } else if (op === 'evaluate') {
-        const val = math.evaluate(expr, subs);
-        output = {
-          operation: op,
-          result_str: String(val),
-          numeric_approx: typeof val === 'number' && Number.isFinite(val) ? val : null,
-        };
-      } else if (op === 'matrix_det') {
-        const mat = inputPayload.matrix_a as number[][];
-        const det = math.det(mat);
-        output = { operation: op, determinant: det };
-      } else if (op === 'linear_solve') {
-        const a = inputPayload.matrix_a as number[][];
-        const b = inputPayload.vector_b as number[];
-        const sol = math.lusolve(a, b) as number[][];
-        const flat = sol.map((r) => (Array.isArray(r) ? r[0] : Number(r)));
-        const residual = math.norm(math.subtract(math.multiply(a, flat), b));
-        output = { operation: op, solution: flat, residual_norm: Number(residual) };
-      } else {
-        throw new Error(`Unsupported symbolic_math operation: ${op}`);
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill('SIGKILL');
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        reject(new Error(`Python sandbox timed out after ${timeoutMs}ms`));
       }
-    } else if (toolName === 'dimensional_analysis') {
-      const op = String(inputPayload.operation ?? 'convert');
-      if (op === 'convert') {
-        const val = Number(inputPayload.value);
-        const fromU = String(inputPayload.from_unit);
-        const toU = String(inputPayload.to_unit);
-        const converted = math.unit(val, fromU).toNumber(toU);
-        output = {
-          operation: op,
-          consistent: true,
-          converted_value: converted,
-          result_unit: toU,
-          details: `${val} ${fromU} = ${converted} ${toU}`,
-        };
-      } else if (op === 'check_equivalence') {
-        const lhs = math.unit(1, String(inputPayload.lhs_unit));
-        const rhs = math.unit(1, String(inputPayload.rhs_unit));
-        const consistent = lhs.equalBase(rhs);
-        output = {
-          operation: op,
-          consistent,
-          details: consistent ? 'Dimensions match' : `Mismatch: ${lhs.formatUnits()} vs ${rhs.formatUnits()}`,
-        };
-      } else {
-        throw new Error(`Unsupported dimensional_analysis operation: ${op}`);
-      }
-    } else if (toolName === 'independent_verifier') {
-      const vtype = String(inputPayload.verification_type);
-      const candidate = Number(inputPayload.candidate_value);
-      const tol = Number(inputPayload.tolerance ?? 1e-4);
+    }, timeoutMs);
 
-      if (vtype === 'numeric_tolerance') {
-        const ref = Number(inputPayload.expected_reference);
-        const absErr = Math.abs(candidate - ref);
-        const relErr = absErr / Math.max(Math.abs(ref), 1e-12);
-        const passed = absErr <= tol || relErr <= tol;
-        output = {
-          passed,
-          method_used: 'direct_tolerance_comparison',
-          independent_value: ref,
-          candidate_value: candidate,
-          absolute_error: absErr,
-          relative_error: relErr,
-          tolerance: tol,
-          details: `abs_err=${absErr.toExponential(3)}, rel_err=${relErr.toExponential(3)}`,
-        };
-      } else if (vtype === 'integral_quadrature') {
-        const expr = String(inputPayload.expression);
-        const variable = String(inputPayload.variable ?? 'x');
-        const lo = Number(inputPayload.lower_limit);
-        const hi = Number(inputPayload.upper_limit);
-        const pyCode = `
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (stdout.length < 1024 * 1024) stdout += chunk.toString('utf-8');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (stderr.length < 1024 * 1024) stderr += chunk.toString('utf-8');
+    });
+    child.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        reject(err);
+      }
+    });
+    child.on('close', (codeExit) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        try {
+          resolve(parsePythonOutput(stdout, stderr, codeExit ?? 1));
+        } catch (err) {
+          reject(err);
+        }
+      }
+    });
+
+    child.stdin.write(code);
+    child.stdin.end();
+  });
+}
+
+function executeSyncMathOrUnits(toolName: string, inputPayload: Record<string, unknown>): Record<string, unknown> {
+  if (toolName === 'symbolic_math') {
+    const op = String(inputPayload.operation ?? 'evaluate');
+    const expr = String(inputPayload.expression ?? '');
+    const variable = String(inputPayload.variable ?? 'x');
+    const subs = (inputPayload.substitutions as Record<string, number> | undefined) ?? {};
+
+    if (op === 'diff') {
+      const d = math.derivative(expr, variable);
+      const evaluated = Object.keys(subs).length > 0 ? Number(d.evaluate(subs)) : null;
+      return { operation: op, result_str: d.toString(), result_latex: d.toTex(), numeric_approx: evaluated };
+    }
+    if (op === 'simplify') {
+      const s = math.simplify(expr);
+      return { operation: op, result_str: s.toString(), result_latex: s.toTex() };
+    }
+    if (op === 'evaluate') {
+      const val = math.evaluate(expr, subs);
+      return {
+        operation: op,
+        result_str: String(val),
+        numeric_approx: typeof val === 'number' && Number.isFinite(val) ? val : null,
+      };
+    }
+    if (op === 'matrix_det') {
+      const mat = inputPayload.matrix_a as number[][];
+      const det = math.det(mat);
+      return { operation: op, determinant: det };
+    }
+    if (op === 'linear_solve') {
+      const a = inputPayload.matrix_a as number[][];
+      const b = inputPayload.vector_b as number[];
+      const sol = math.lusolve(a, b) as number[][];
+      const flat = sol.map((r) => (Array.isArray(r) ? r[0] : Number(r)));
+      const residual = math.norm(math.subtract(math.multiply(a, flat), b));
+      return { operation: op, solution: flat, residual_norm: Number(residual) };
+    }
+    throw new Error(`Unsupported symbolic_math operation: ${op}`);
+  }
+
+  if (toolName === 'dimensional_analysis') {
+    const op = String(inputPayload.operation ?? 'convert');
+    if (op === 'convert') {
+      const val = Number(inputPayload.value);
+      const fromU = String(inputPayload.from_unit);
+      const toU = String(inputPayload.to_unit);
+      const converted = math.unit(val, fromU).toNumber(toU);
+      return {
+        operation: op,
+        consistent: true,
+        converted_value: converted,
+        result_unit: toU,
+        details: `${val} ${fromU} = ${converted} ${toU}`,
+      };
+    }
+    if (op === 'check_equivalence') {
+      const lhs = math.unit(1, String(inputPayload.lhs_unit));
+      const rhs = math.unit(1, String(inputPayload.rhs_unit));
+      const consistent = lhs.equalBase(rhs);
+      return {
+        operation: op,
+        consistent,
+        details: consistent ? 'Dimensions match' : `Mismatch: ${lhs.formatUnits()} vs ${rhs.formatUnits()}`,
+      };
+    }
+    throw new Error(`Unsupported dimensional_analysis operation: ${op}`);
+  }
+
+  throw new Error(`Unsupported sync tool: ${toolName}`);
+}
+
+function buildVerifierPythonCode(inputPayload: Record<string, unknown>): { pyCode: string; label: string } {
+  const vtype = String(inputPayload.verification_type);
+  const candidate = Number(inputPayload.candidate_value);
+  const tol = Number(inputPayload.tolerance ?? 1e-4);
+
+  if (vtype === 'integral_quadrature') {
+    const expr = String(inputPayload.expression);
+    const variable = String(inputPayload.variable ?? 'x');
+    const lo = Number(inputPayload.lower_limit);
+    const hi = Number(inputPayload.upper_limit);
+    return {
+      label: 'Simpson quadrature',
+      pyCode: `
 import math
 def f(${variable}):
     return ${expr}
@@ -253,19 +316,19 @@ RESULT = {
     "absolute_error": abs_err,
     "relative_error": rel_err,
     "tolerance": ${tol},
-    "details": f"Composite Simpson (n=2000) = {quad:.10g}"
+    "details": f"Composite Simpson (n=2000) = {quad:.15g}"
 }
-`;
-        const pyOut = runIsolatedPython(pyCode);
-        if (pyOut.exitCode !== 0 || !pyOut.result) {
-          throw new Error(pyOut.stderr || 'Simpson quadrature failed');
-        }
-        output = pyOut.result as Record<string, unknown>;
-      } else if (vtype === 'derivative_finite_diff') {
-        const expr = String(inputPayload.expression);
-        const variable = String(inputPayload.variable ?? 'x');
-        const pt = Number(inputPayload.point ?? 1.0);
-        const pyCode = `
+`,
+    };
+  }
+
+  if (vtype === 'derivative_finite_diff') {
+    const expr = String(inputPayload.expression);
+    const variable = String(inputPayload.variable ?? 'x');
+    const pt = Number(inputPayload.point ?? 1.0);
+    return {
+      label: 'Finite difference check',
+      pyCode: `
 import math
 def f(${variable}):
     return ${expr}
@@ -281,18 +344,18 @@ RESULT = {
     "absolute_error": abs_err,
     "relative_error": rel_err,
     "tolerance": ${tol},
-    "details": f"Central finite difference at ${variable}=${pt}: {fd:.10g}"
+    "details": f"Central finite difference at ${variable}=${pt}: {fd:.12g}"
 }
-`;
-        const pyOut = runIsolatedPython(pyCode);
-        if (pyOut.exitCode !== 0 || !pyOut.result) {
-          throw new Error(pyOut.stderr || 'Finite difference check failed');
-        }
-        output = pyOut.result as Record<string, unknown>;
-      } else if (vtype === 'root_residual') {
-        const expr = String(inputPayload.expression);
-        const variable = String(inputPayload.variable ?? 'x');
-        const pyCode = `
+`,
+    };
+  }
+
+  if (vtype === 'root_residual') {
+    const expr = String(inputPayload.expression);
+    const variable = String(inputPayload.variable ?? 'x');
+    return {
+      label: 'Root residual check',
+      pyCode: `
 import math
 def f(${variable}):
     return ${expr}
@@ -307,22 +370,21 @@ RESULT = {
     "tolerance": ${tol},
     "details": f"|f(${candidate})| = {res:.3e}"
 }
-`;
-        const pyOut = runIsolatedPython(pyCode);
-        if (pyOut.exitCode !== 0 || !pyOut.result) {
-          throw new Error(pyOut.stderr || 'Root residual check failed');
-        }
-        output = pyOut.result as Record<string, unknown>;
-      } else if (vtype === 'black_scholes_mc') {
-        const s0 = Number(inputPayload.spot);
-        const k = Number(inputPayload.strike);
-        const r = Number(inputPayload.rate);
-        const sigma = Number(inputPayload.volatility);
-        const t = Number(inputPayload.time_to_maturity);
-        const optType = String(inputPayload.option_type ?? 'call');
-        const pyCode = `
+`,
+    };
+  }
+
+  if (vtype === 'black_scholes_mc') {
+    const s0 = Number(inputPayload.spot);
+    const k = Number(inputPayload.strike);
+    const r = Number(inputPayload.rate);
+    const sigma = Number(inputPayload.volatility);
+    const t = Number(inputPayload.time_to_maturity);
+    const optType = String(inputPayload.option_type ?? 'call');
+    return {
+      label: 'Monte Carlo check',
+      pyCode: `
 import math
-# Deterministic Halton-like / Box-Muller LCG Monte Carlo antithetic check
 state = 42
 def rand_u():
     global state
@@ -352,14 +414,49 @@ RESULT = {
     "tolerance": mc_tol,
     "details": f"Antithetic Monte Carlo (50,000 paths) = {mc:.6f}"
 }
-`;
+`,
+    };
+  }
+
+  throw new Error(`Unsupported verification_type: ${vtype}`);
+}
+
+export function executeTool(toolName: string, inputPayload: Record<string, unknown>): ToolExecutionRecord {
+  const callId = `tc_${crypto.randomBytes(6).toString('hex')}`;
+  const t0 = performance.now();
+
+  try {
+    let output: Record<string, unknown> = {};
+
+    if (toolName === 'symbolic_math' || toolName === 'dimensional_analysis') {
+      output = executeSyncMathOrUnits(toolName, inputPayload);
+    } else if (toolName === 'independent_verifier') {
+      const vtype = String(inputPayload.verification_type);
+      const candidate = Number(inputPayload.candidate_value);
+      const tol = Number(inputPayload.tolerance ?? 1e-4);
+
+      if (vtype === 'numeric_tolerance') {
+        const ref = Number(inputPayload.expected_reference);
+        const absErr = Math.abs(candidate - ref);
+        const relErr = absErr / Math.max(Math.abs(ref), 1e-12);
+        const passed = absErr <= tol || relErr <= tol;
+        output = {
+          passed,
+          method_used: 'direct_tolerance_comparison',
+          independent_value: ref,
+          candidate_value: candidate,
+          absolute_error: absErr,
+          relative_error: relErr,
+          tolerance: tol,
+          details: `abs_err=${absErr.toExponential(3)}, rel_err=${relErr.toExponential(3)}`,
+        };
+      } else {
+        const { pyCode, label } = buildVerifierPythonCode(inputPayload);
         const pyOut = runIsolatedPython(pyCode);
         if (pyOut.exitCode !== 0 || !pyOut.result) {
-          throw new Error(pyOut.stderr || 'Monte Carlo check failed');
+          throw new Error(pyOut.stderr || `${label} failed`);
         }
         output = pyOut.result as Record<string, unknown>;
-      } else {
-        throw new Error(`Unsupported verification_type: ${vtype}`);
       }
     } else if (toolName === 'python_sandbox') {
       const code = String(inputPayload.code ?? '');
@@ -401,4 +498,147 @@ RESULT = {
       executed_at: new Date().toISOString(),
     };
   }
+}
+
+export async function executeToolAsync(
+  toolName: string,
+  inputPayload: Record<string, unknown>,
+): Promise<ToolExecutionRecord> {
+  const callId = `tc_${crypto.randomBytes(6).toString('hex')}`;
+  const t0 = performance.now();
+
+  try {
+    let output: Record<string, unknown> = {};
+
+    if (toolName === 'symbolic_math' || toolName === 'dimensional_analysis') {
+      output = executeSyncMathOrUnits(toolName, inputPayload);
+    } else if (toolName === 'independent_verifier') {
+      const vtype = String(inputPayload.verification_type);
+      const candidate = Number(inputPayload.candidate_value);
+      const tol = Number(inputPayload.tolerance ?? 1e-4);
+
+      if (vtype === 'numeric_tolerance') {
+        const ref = Number(inputPayload.expected_reference);
+        const absErr = Math.abs(candidate - ref);
+        const relErr = absErr / Math.max(Math.abs(ref), 1e-12);
+        const passed = absErr <= tol || relErr <= tol;
+        output = {
+          passed,
+          method_used: 'direct_tolerance_comparison',
+          independent_value: ref,
+          candidate_value: candidate,
+          absolute_error: absErr,
+          relative_error: relErr,
+          tolerance: tol,
+          details: `abs_err=${absErr.toExponential(3)}, rel_err=${relErr.toExponential(3)}`,
+        };
+      } else {
+        const { pyCode, label } = buildVerifierPythonCode(inputPayload);
+        const pyOut = await runIsolatedPythonAsync(pyCode);
+        if (pyOut.exitCode !== 0 || !pyOut.result) {
+          throw new Error(pyOut.stderr || `${label} failed`);
+        }
+        output = pyOut.result as Record<string, unknown>;
+      }
+    } else if (toolName === 'python_sandbox') {
+      const code = String(inputPayload.code ?? '');
+      if (!code.trim()) {
+        throw new Error('code must be non-empty');
+      }
+      const pyOut = await runIsolatedPythonAsync(code);
+      if (pyOut.exitCode !== 0) {
+        throw new Error(pyOut.stderr || `Python sandbox exited with code ${pyOut.exitCode}`);
+      }
+      output = {
+        stdout: pyOut.stdout,
+        result: pyOut.result,
+        exit_code: pyOut.exitCode,
+      };
+    } else {
+      throw new Error(`Unknown tool: ${toolName}`);
+    }
+
+    return {
+      tool_call_id: callId,
+      tool_name: toolName,
+      input_payload: inputPayload,
+      output_payload: output,
+      success: true,
+      error_message: null,
+      duration_ms: Number((performance.now() - t0).toFixed(2)),
+      executed_at: new Date().toISOString(),
+    };
+  } catch (err) {
+    return {
+      tool_call_id: callId,
+      tool_name: toolName,
+      input_payload: inputPayload,
+      output_payload: {},
+      success: false,
+      error_message: err instanceof Error ? err.message : String(err),
+      duration_ms: Number((performance.now() - t0).toFixed(2)),
+      executed_at: new Date().toISOString(),
+    };
+  }
+}
+
+function stableStringify(obj: unknown): string {
+  if (obj === null || typeof obj !== 'object') {
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return `[${obj.map(stableStringify).join(',')}]`;
+  }
+  const entries = Object.entries(obj as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+}
+
+export async function executeToolsParallelWithCache(
+  calls: Array<{ task_id: string; tool_name: string; arguments_json: string }>,
+  cache: Map<string, ToolExecutionRecord>,
+): Promise<ToolExecutionRecord[]> {
+  const inflight = new Map<string, Promise<ToolExecutionRecord>>();
+
+  const tasks = calls.map(async (call) => {
+    let parsedArgs: Record<string, unknown>;
+    try {
+      parsedArgs = JSON.parse(call.arguments_json) as Record<string, unknown>;
+    } catch (err) {
+      return {
+        tool_call_id: `tc_err_${call.task_id}`,
+        tool_name: call.tool_name,
+        input_payload: { raw: call.arguments_json },
+        output_payload: {},
+        success: false,
+        error_message: err instanceof Error ? err.message : String(err),
+        duration_ms: 0,
+        executed_at: new Date().toISOString(),
+      } satisfies ToolExecutionRecord;
+    }
+
+    const cacheKey = `${call.tool_name}:${stableStringify(parsedArgs)}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return {
+        ...cached,
+        tool_call_id: `tc_cached_${crypto.randomBytes(4).toString('hex')}`,
+        duration_ms: 0,
+        executed_at: new Date().toISOString(),
+      };
+    }
+
+    let pending = inflight.get(cacheKey);
+    if (!pending) {
+      pending = executeToolAsync(call.tool_name, parsedArgs).then((res) => {
+        if (res.success) {
+          cache.set(cacheKey, res);
+        }
+        return res;
+      });
+      inflight.set(cacheKey, pending);
+    }
+    return pending;
+  });
+
+  return Promise.all(tasks);
 }

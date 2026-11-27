@@ -150,19 +150,35 @@ pytest -v
 ruff check app tests
 ```
 
-## 6. Evaluation & Benchmarking
+## 6. Complexity Routing & Fast Path Optimization
 
-Run the 32-problem benchmark across 4 modes (`baseline_single_pass`, `ablation_no_verifier`, `ablation_no_critic`, `full_multi_agent`):
+VeriSTEM routes incoming problems through a deterministic **Problem Complexity Router** (`app/router/complexity.py` & `server/complexity_router.ts`) before invoking LLM orchestration:
+
+- **LEVEL_1_SIMPLE -> `FAST_PATH`**: Direct calculus integrals/derivatives, algebraic equations, 2x2–3x3 linear systems, matrix determinants, unit conversions, and arithmetic expressions. Solved deterministically via symbolic computation + **independent Python/SciPy numerical verification** in sub-second latency without unnecessary LLM round-trips.
+- **LEVEL_2_INTERMEDIATE / LEVEL_3_ADVANCED / LEVEL_4_RESEARCH -> `MULTI_AGENT_WORKFLOW`**: Multi-step physics, quantitative finance, coupled systems, and open-ended scientific problems routed through the full stateful LangGraph multi-agent pipeline with parallel deduplicated tool execution, bounded retries, and deterministic verification safeguards.
+
+If the Fast Path cannot parse an expression or any independent check fails, execution automatically escalates to `MULTI_AGENT_WORKFLOW`.
+
+## 7. Evaluation & Benchmarking
+
+Run the 32-problem ablation evaluation (`baseline_single_pass`, `ablation_no_verifier`, `ablation_no_critic`, `full_multi_agent`):
 
 ```bash
 cd veristem
 python scripts/run_evaluation.py
 ```
 
-Outputs are saved to `benchmarks/results/evaluation_report.json` and `benchmarks/results/evaluation_report.csv`.
+Run the 50-problem performance benchmark suite (`datasets/perf_benchmarks_50.json`) from the workspace root:
 
-## 7. Known Limitations
+```bash
+npx tsx scripts/run_perf_benchmark.ts
+```
 
-- Symbolic parsing relies on SymPy `parse_expr` transformations; highly custom notation may require the isolated Python sandbox tool.
+Outputs are saved to `benchmarks/results/`.
+
+## 8. Known Limitations
+
+- Symbolic parsing relies on SymPy/mathjs transformations; highly custom notation escalates automatically to the multi-agent workflow and isolated Python sandbox.
 - The in-process sliding-window rate limiter applies per worker instance; multi-worker deployments should place Redis or an API gateway in front.
 - Live Gemini latency and token costs depend on problem complexity and external API availability.
+

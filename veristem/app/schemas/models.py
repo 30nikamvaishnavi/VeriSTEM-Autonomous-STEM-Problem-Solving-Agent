@@ -32,6 +32,18 @@ class WorkflowStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class ComplexityLevel(str, Enum):
+    LEVEL_1_SIMPLE = "LEVEL_1_SIMPLE"
+    LEVEL_2_INTERMEDIATE = "LEVEL_2_INTERMEDIATE"
+    LEVEL_3_ADVANCED = "LEVEL_3_ADVANCED"
+    LEVEL_4_RESEARCH = "LEVEL_4_RESEARCH"
+
+
+class ExecutionPath(str, Enum):
+    FAST_PATH = "FAST_PATH"
+    MULTI_AGENT_WORKFLOW = "MULTI_AGENT_WORKFLOW"
+
+
 class MathematicalVariable(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -178,6 +190,9 @@ class FinalSolutionReport(BaseModel):
     tool_execution_history: list[ToolExecutionRecord] = Field(default_factory=list)
     confidence_limitations: list[str] = Field(default_factory=list)
     explanation_markdown: str
+    complexity_level: ComplexityLevel | None = None
+    execution_path: ExecutionPath | None = None
+    elapsed_ms: float | None = None
     started_at: datetime
     completed_at: datetime = Field(default_factory=utc_now)
 
@@ -213,12 +228,16 @@ class SolveProblemRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=128)
     max_correction_attempts: int = Field(default=3, ge=1, le=5)
     run_async: bool = True
+    force_multi_agent: bool = False
 
 
 class SolveProblemResponse(BaseModel):
     problem_id: str
     execution_id: str
     status: WorkflowStatus
+    complexity_level: ComplexityLevel | None = None
+    execution_path: ExecutionPath | None = None
+    elapsed_ms: float | None = None
     message: str
 
 
@@ -236,6 +255,9 @@ class ProblemStatusResponse(BaseModel):
     execution_id: str | None
     status: WorkflowStatus
     current_stage: str
+    complexity_level: ComplexityLevel | None = None
+    execution_path: ExecutionPath | None = None
+    elapsed_ms: float | None = None
     correction_attempts: int
     verification_status: VerificationStatus | None = None
     needs_clarification: bool = False
@@ -250,6 +272,9 @@ class ProblemDetailResponse(BaseModel):
     domain_hint: ProblemDomain | None
     status: WorkflowStatus
     current_stage: str
+    complexity_level: ComplexityLevel | None = None
+    execution_path: ExecutionPath | None = None
+    elapsed_ms: float | None = None
     specification: ProblemSpecification | None = None
     plan: ExecutionPlan | None = None
     agent_timeline: list[AgentExecutionResult] = Field(default_factory=list)

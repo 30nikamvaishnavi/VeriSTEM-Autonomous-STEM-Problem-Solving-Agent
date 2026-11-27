@@ -27,10 +27,16 @@ export function ReportView({ report }: ReportViewProps) {
     <div className="bg-white border border-slate-200 rounded-lg p-6 space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4 pb-5 border-b border-slate-200">
         <div>
-          <div className="flex items-center gap-2 text-xs text-slate-500 font-mono">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono">
             <span>{report.problem_id}</span>
             <span aria-hidden="true">·</span>
             <span>{report.detected_domain.replace('_', ' ')}</span>
+            {report.execution_path && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-slate-800">{report.execution_path}</span>
+              </>
+            )}
             <span aria-hidden="true">·</span>
             <span>Verified {report.verification_status}</span>
           </div>
@@ -87,6 +93,20 @@ export function ReportView({ report }: ReportViewProps) {
             <span className="text-slate-500">Numeric Value</span>
             <span className="text-slate-900">
               {report.numeric_value !== null ? report.numeric_value : 'Symbolic'}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-500">Complexity</span>
+            <span className="text-slate-900">{report.complexity_level ?? 'STANDARD'}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-500">Elapsed Time</span>
+            <span className="text-slate-900">
+              {report.elapsed_ms !== undefined
+                ? report.elapsed_ms >= 1000
+                  ? `${(report.elapsed_ms / 1000).toFixed(2)} s`
+                  : `${report.elapsed_ms.toFixed(1)} ms`
+                : '—'}
             </span>
           </div>
           <div className="flex justify-between">
