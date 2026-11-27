@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: veristem
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veristem_dev_password}
+      POSTGRES_DB: veristem
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veristem"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-4-hydrogen}
+      VERISTEM_API_KEY: ${VERISTEM_API_KEY:-}
+      DATABASE_URL: postgresql+psycopg://veristem:${POSTGRES_PASSWORD:-veristem_dev_password}@postgres:5432/veristem
+      LANGGRAPH_CHECKPOINT_DB: /app/data/checkpoints.db
+      SANDBOX_TIMEOUT_SECONDS: 10
+      SANDBOX_MEMORY_MB: 256
+    volumes:
+      - veristem_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      VERISTEM_API_URL: http://api:8000
+      VERISTEM_API_KEY: ${VERISTEM_API_KEY:-}
+    depends_on:
+      - api
+    command: ["streamlit", "run", "frontend/streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+volumes:
+  pgdata:
+  veristem_data:

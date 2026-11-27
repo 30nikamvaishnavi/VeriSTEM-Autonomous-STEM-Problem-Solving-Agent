@@ -1,0 +1,6 @@
+{
+  "name": "VeriSTEM",
+  "description": "Autonomous, verifiable multi-agent STEM problem-solving and scientific reasoning platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
